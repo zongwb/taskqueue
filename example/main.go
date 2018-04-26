@@ -2,27 +2,37 @@ package main
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/zongwb/taskqueue"
 	"time"
 )
 
 func main() {
-	fmt.Println("vim-go")
+	log.Println("vim-go")
 
-	q := taskqueue.NewTaskQueue(2, 100, time.Second, time.Millisecond*50)
-	q.Start()
+	q := taskqueue.New(5, 10, time.Second*1000, 0)
 
-	job := &Job{
-		name: "dummy job",
+	n := 20
+	for i := 0; i < n; i++ {
+		job := &Job{
+			name: fmt.Sprintf("dummy job %d", i),
+		}
+		// Whether to use Post or PostAndExec depends on the application.
+		err := q.Post(job)
+		if err != nil {
+			log.Println(err)
+		}
+		// q.PostAndExec(job)
+		if i == 10 {
+			q.Close()
+			//q.Cancel()
+		}
 	}
-	q.Dispatch(job)
-	job2 := &Job{
-		name: "dummy job 2",
-	}
-	q.Dispatch(job2)
 
-	q.Stop()
+	log.Println("Waiting to complete...")
+	q.CloseAndWait()
+	//q.Wait()
 }
 
 type Job struct {
@@ -30,6 +40,7 @@ type Job struct {
 }
 
 func (j *Job) Do() error {
-	fmt.Printf("Processing job: %s\n", j.name)
+	log.Printf("Processing job: %s\n", j.name)
+	time.Sleep(time.Second)
 	return nil
 }
