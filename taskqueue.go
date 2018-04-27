@@ -212,7 +212,7 @@ func (m *TaskQueue) prepareTask(t Task) (*TimedTask, error) {
 }
 
 // TryPost sends a task to the task queue and returns immediately without waiting for
-// the task's execution. If the queue is full, it returns immediately with an error
+// the task's execution. If the queue is full, it returns immediately with an error.
 //
 // This is usually used in a fan-out pattern.
 func (m *TaskQueue) TryPost(t Task) error {
@@ -233,6 +233,11 @@ func (m *TaskQueue) tryPostCore(t Task) error {
 		return ErrQueueFull
 	}
 	return nil
+}
+
+// PendingTasks returns the number of tasks waiting in the queue.
+func (m *TaskQueue) PendingTasks() int {
+	return len(m.taskQueue)
 }
 
 // TimedTask implements the task interface and wraps another task.
