@@ -1,23 +1,38 @@
+// The simple task queue implementation caters to two concurrency patterns: fan-in and fan-out.
+//
+// In a fan-in pattern, the client normally has many goroutines, and there is a need to
+// control the concurrency to the (backend) computing resource. Use PostAndExec() in this case.
+//
+// In a fan-out pattern, the client is often single-threaded (e.g. a task dispatcher),
+// and there is a need to execute the tasks in parallel. Use Post() in this case.
+
 package taskqueue
 
 import (
-	"errors"
 	"sync"
 	"time"
 )
 
 var (
-	//EnqueueTimeout = time.Millisecond * 20
-
 	// ErrQueueCancelled ...
-	ErrQueueCancelled = errors.New("queue cancelled")
+	ErrQueueCancelled = &TQError{Reason: "queue is cancelled"}
 	// ErrQueueClosed ...
-	ErrQueueClosed = errors.New("queue closed")
+	ErrQueueClosed = &TQError{Reason: "queue is closed"}
 	// ErrTaskExpired ...
-	ErrTaskExpired = errors.New("task expired")
+	ErrTaskExpired = &TQError{Reason: "task expired"}
 	// ErrQueueFull ...
-	ErrQueueFull = errors.New("processing queue is full")
+	ErrQueueFull = &TQError{Reason: "queue is full"}
 )
+
+// TQError defines a concrete error type so that client can determine
+// if the error returned by Post() is from the application or the task queue.
+type TQError struct {
+	Reason string
+}
+
+func (e *TQError) Error() string {
+	return e.Reason
+}
 
 // Task defines the callback interface for the real task.
 type Task interface {
@@ -26,30 +41,25 @@ type Task interface {
 
 // TaskQueue implements a FIFO task queue with a pool of workers.
 type TaskQueue struct {
-	threads        int
-	queueSize      int
-	taskTimeout    time.Duration
-	enqueueTimeout time.Duration
-	taskQueue      chan Task
-	closed         bool
-	quit           chan bool
-	closeQueue     sync.Once
-	cancelQueue    sync.Once
-	wg             sync.WaitGroup
-	sync.RWMutex   // guard the 'closed' flag
+	threads      int
+	queueSize    int
+	taskTimeout  time.Duration
+	taskQueue    chan Task
+	closed       bool
+	quit         chan bool
+	closeQueue   sync.Once
+	cancelQueue  sync.Once
+	wg           sync.WaitGroup
+	sync.RWMutex // guard the 'closed' flag
 }
 
 // New creates a new instance.
 // taskTimeout: the maximum waiting time before the task is processed.
-// enqueueTimeout: the waiting time before the task can be queued when the queue is full.
-//                 if enqueueTimeout = 0, the enqueue operation will block.
-// Note that if enqueueTimeout = 0, make sure taskTimeout is long enough to have a chance to be executed.
-func New(threads, queueSize int, taskTimeout, enqueueTimeout time.Duration) *TaskQueue {
+func New(threads, queueSize int, taskTimeout time.Duration) *TaskQueue {
 	m := &TaskQueue{
-		threads:        threads,
-		queueSize:      queueSize,
-		taskTimeout:    taskTimeout,
-		enqueueTimeout: enqueueTimeout,
+		threads:     threads,
+		queueSize:   queueSize,
+		taskTimeout: taskTimeout,
 	}
 	m.start()
 	return m
@@ -96,7 +106,8 @@ func (m *TaskQueue) Wait() {
 	m.wg.Wait()
 }
 
-// Close stops all workers.
+// Close stops all workers. Due to locking,
+// calling Close may block until it has a chance to close the channel.
 func (m *TaskQueue) Close() {
 	m.closeQueue.Do(func() {
 		m.Lock()
@@ -113,44 +124,38 @@ func (m *TaskQueue) CloseAndWait() {
 }
 
 // PostAndExec sends a task to the task queue and waits for the task's execution to complete.
-// This is usually used in a fan-in pattern.
-// The enqueue operation is either blocking or time-out depending on enqueueTimeout.
+// enqueueTimeout: the waiting time before the task can be enqueued when the queue is full.
+//                 if enqueueTimeout = 0, the enqueue operation will block.
+// Note that if enqueueTimeout = 0, make sure taskTimeout is long enough to have a chance to be executed.
+//
 // This is a convenient wrapper for waiting for the execution result. Client can implement
 // the same behaviour with Post() by waiting on a signal.
-func (m *TaskQueue) PostAndExec(t Task) error {
-	return m.postCore(t, true)
+//
+// This is usually used in a fan-in pattern.
+func (m *TaskQueue) PostAndExec(t Task, enqueueTimeout time.Duration) error {
+	return m.postCore(t, enqueueTimeout, true)
 }
 
 // Post sends a task to the task queue and returns immediately without waiting for
-// the task's execution. This is usually used in a fan-out pattern.
-// The enqueue operation is either blocking or time-out depending on enqueueTimeout.
-func (m *TaskQueue) Post(t Task) error {
-	return m.postCore(t, false)
+// the task's execution.
+// enqueueTimeout: the waiting time before the task can be enqueued when the queue is full.
+//                 if enqueueTimeout = 0, the enqueue operation will block.
+// Note that if enqueueTimeout = 0, make sure taskTimeout is long enough to have a chance to be executed.
+//
+// This is usually used in a fan-out pattern.
+func (m *TaskQueue) Post(t Task, enqueueTimeout time.Duration) error {
+	return m.postCore(t, enqueueTimeout, false)
 }
 
-func (m *TaskQueue) postCore(t Task, sync bool) error {
-	// check if queue is cancelled
-	select {
-	case <-m.quit:
-		return ErrQueueCancelled
-	default:
-	}
-
-	// check if queue is closed
+func (m *TaskQueue) postCore(t Task, enqueueTimeout time.Duration, sync bool) error {
 	m.RLock()
 	defer m.RUnlock()
-	if m.closed {
-		return ErrQueueClosed
+	newT, err := m.prepareTask(t)
+	if err != nil {
+		return err
 	}
 
-	newT := &TimedTask{
-		start:   time.Now(),
-		timeout: m.taskTimeout,
-		t:       t,
-		notify:  make(chan error, 1),
-	}
-	var err error
-	if m.enqueueTimeout == 0 {
+	if enqueueTimeout == 0 {
 		select {
 		case m.taskQueue <- newT:
 			// This is a blocking enqueue.
@@ -158,7 +163,7 @@ func (m *TaskQueue) postCore(t Task, sync bool) error {
 			return ErrQueueCancelled
 		}
 	} else {
-		timer := time.NewTimer(m.enqueueTimeout)
+		timer := time.NewTimer(enqueueTimeout)
 		select {
 		case m.taskQueue <- newT:
 			timer.Stop()
@@ -181,6 +186,53 @@ func (m *TaskQueue) postCore(t Task, sync bool) error {
 		return ErrQueueCancelled
 	}
 	return err
+}
+
+// Read lock must be acquired before calling prepareTask.
+func (m *TaskQueue) prepareTask(t Task) (*TimedTask, error) {
+	// check if queue is cancelled
+	select {
+	case <-m.quit:
+		return nil, ErrQueueCancelled
+	default:
+	}
+
+	// check if queue is closed
+	if m.closed {
+		return nil, ErrQueueClosed
+	}
+
+	newT := &TimedTask{
+		start:   time.Now(),
+		timeout: m.taskTimeout,
+		t:       t,
+		notify:  make(chan error, 1),
+	}
+	return newT, nil
+}
+
+// TryPost sends a task to the task queue and returns immediately without waiting for
+// the task's execution. If the queue is full, it returns immediately with an error
+//
+// This is usually used in a fan-out pattern.
+func (m *TaskQueue) TryPost(t Task) error {
+	return m.tryPostCore(t)
+}
+
+func (m *TaskQueue) tryPostCore(t Task) error {
+	m.RLock()
+	defer m.RUnlock()
+	newT, err := m.prepareTask(t)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case m.taskQueue <- newT:
+	default:
+		return ErrQueueFull
+	}
+	return nil
 }
 
 // TimedTask implements the task interface and wraps another task.
